@@ -1,18 +1,18 @@
-// CONFIGURATION ====================================================
-const TARGET_FOLDER_ID = "0AOwK4tpNSFtuUk9PVA"; // Change this to your exact folder ID
-var GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/10BSIOSJAUR-9ru-JC5X_hEvhZ8lKS5EpUke_V1cX2x4/edit";
-var GOOGLE_SHEET_RESULTS_TAB_NAME_DRIVES = "Sheet1";
+// CONFIGURACIÓN ====================================================
+const TARGET_FOLDER_ID = "0AOwK4tpNSFtuUk9PVA"; // Cambia por el ID de tu carpeta principal
+const GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/10BSIOSJAUR-9ru-JC5X_hEvhZ8lKS5EpUke_V1cX2x4/edit";
 const EMAIL_RECIPIENT_ADDRESS = 'your-email@your.domain';
-const MAX_RUN_TIME_MINUTES = 30;
-const FOLDERS_BETWEEN_SAVES = 10;
+const MAX_RUN_TIME_MINUTES = 5; // Tiempo de ejecución más corto para evitar fallos
+const BATCH_SIZE = 500; // Número de filas a procesar antes de guardar
 
-// GLOBALS =========================================================
-var processedFolders = 0;
-var processedFiles = 0;
+// GLOBALES =========================================================
 var startTime;
-var allData = []; // Array to store all the data before writing to the sheet
+var allData = []; // Array para almacenar datos por lotes
 
-// HELPER FUNCTIONS ================================================
+// PROPIEDADES DE SCRIPT para guardar el estado
+const PROPERTIES = PropertiesService.getScriptProperties();
+
+// FUNCIONES DE AYUDA ===============================================
 function getSimplifiedType(mimeType) {
   const types = {
     'application/vnd.google-apps.folder': 'FOLDER',
@@ -26,39 +26,51 @@ function getSimplifiedType(mimeType) {
   return types[mimeType] || mimeType.split('/').pop().toUpperCase().substring(0, 10);
 }
 
-function findTargetFolder() {
-  return DriveApp.getFolderById(TARGET_FOLDER_ID);
+function getSheetByName(sheetName) {
+  const spreadsheet = SpreadsheetApp.openByUrl(GOOGLE_SHEET_URL);
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+  }
+  return sheet;
 }
 
-function initializeSheet() {
-  const spreadsheet = SpreadsheetApp.openByUrl(GOOGLE_SHEET_URL);
-  const sheet = spreadsheet.getSheetByName(GOOGLE_SHEET_RESULTS_TAB_NAME_DRIVES) ||
-    spreadsheet.insertSheet(GOOGLE_SHEET_RESULTS_TAB_NAME_DRIVES);
-
+function initializeSheet(sheetName) {
+  const sheet = getSheetByName(sheetName);
   sheet.clear();
   const filter = sheet.getFilter();
   if (filter) filter.remove();
 
-  // Set headers
   const headers = ["Level", "Path", "Type", "Name", "ID", "URL", "Created", "Updated"];
   sheet.appendRow(headers);
   sheet.getRange("A1:H1")
     .setBackground("#eeeeee")
     .setFontWeight("bold")
     .setHorizontalAlignment("center");
-
-  return sheet;
 }
 
-// MAIN PROCESSING =================================================
-function processFolder(folder, level, parentPath) {
-  if (new Date() - startTime > MAX_RUN_TIME_MINUTES * 60 * 1000) {
-    throw new Error(`Time limit exceeded (${MAX_RUN_TIME_MINUTES} minutes)`);
+function writeDataToSheet(sheetName) {
+  const sheet = getSheetByName(sheetName);
+  if (allData.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, allData.length, allData[0].length).setValues(allData);
+    allData = [];
+    SpreadsheetApp.flush();
+    console.log(`Progreso guardado en la hoja '${sheetName}'. Total de filas: ${sheet.getLastRow() - 1}`);
+  }
+}
+
+// PROCESAMIENTO PRINCIPAL ==========================================
+function processFolderAndFiles(folder, sheetName, level, parentPath) {
+  if ((new Date() - startTime) / 1000 > (MAX_RUN_TIME_MINUTES * 60 - 30)) {
+    writeDataToSheet(sheetName);
+    PROPERTIES.setProperty('lastProcessedSheet', sheetName);
+    PROPERTIES.setProperty('lastProcessedFolder', folder.getId());
+    throw new Error(`Límite de tiempo excedido. Guardando progreso en '${sheetName}'.`);
   }
 
   const folderPath = (parentPath ? parentPath + "/" : "") + folder.getName();
 
-  // Add folder data to the array
   allData.push([
     level,
     "  ".repeat(level) + folder.getName(),
@@ -69,9 +81,7 @@ function processFolder(folder, level, parentPath) {
     folder.getDateCreated(),
     folder.getLastUpdated()
   ]);
-  processedFolders++;
 
-  // Process files
   const files = folder.getFiles();
   while (files.hasNext()) {
     const file = files.next();
@@ -85,99 +95,87 @@ function processFolder(folder, level, parentPath) {
       file.getDateCreated(),
       file.getLastUpdated()
     ]);
-    processedFiles++;
+    if (allData.length >= BATCH_SIZE) {
+      writeDataToSheet(sheetName);
+    }
   }
 
-  // Process subfolders
   const subFolders = folder.getFolders();
   while (subFolders.hasNext()) {
     const subFolder = subFolders.next();
-    processFolder(subFolder, level + 1, folderPath);
+    processFolderAndFiles(subFolder, sheetName, level + 1, folderPath);
   }
 }
 
 function generateDriveTree() {
-  startTime = new Date();
-  processedFolders = 0;
-  processedFiles = 0;
-  allData = []; // Clear the array for a new run
-
-  try {
-    const targetFolder = findTargetFolder();
-
-    console.log(`Starting inventory of: ${targetFolder.getName()}`);
-    processFolder(targetFolder, 0, "");
-
-    // Write all data to the sheet at once
-    const sheet = initializeSheet();
-    if (allData.length > 0) {
-      sheet.getRange(sheet.getLastRow() + 1, 1, allData.length, allData[0].length).setValues(allData);
-    }
+  let mainFolderId = PROPERTIES.getProperty('mainFolderId');
+  let nextMainFolderIndex = parseInt(PROPERTIES.getProperty('nextMainFolderIndex') || '0');
+  
+  if (!mainFolderId) {
+    console.log("Iniciando nuevo inventario de carpetas primarias.");
+    const targetFolder = DriveApp.getFolderById(TARGET_FOLDER_ID);
+    const mainFolders = targetFolder.getFolders();
     
-    // Final formatting
-    sheet.autoResizeColumns(1, 8);
-    if (sheet.getLastRow() > 1) {
-      sheet.getRange(1, 1, sheet.getLastRow(), 8).createFilter();
+    // Guardar los IDs de las carpetas principales para reanudación
+    let mainFolderIds = [];
+    while (mainFolders.hasNext()) {
+      mainFolderIds.push(mainFolders.next().getId());
     }
-    sheet.setFrozenRows(1);
-
-    return {
-      status: "COMPLETE",
-      folders: processedFolders,
-      files: processedFiles,
-      duration: (new Date() - startTime) / 1000
-    };
-
-  } catch (e) {
-    // If the script fails, write the partial data to the sheet before returning
-    const sheet = initializeSheet();
-    if (allData.length > 0) {
-      sheet.getRange(sheet.getLastRow() + 1, 1, allData.length, allData[0].length).setValues(allData);
-    }
-
-    return {
-      status: "PARTIAL",
-      folders: processedFolders,
-      files: processedFiles,
-      error: e.toString(),
-      duration: (new Date() - startTime) / 1000
-    };
+    PROPERTIES.setProperty('mainFolderIds', JSON.stringify(mainFolderIds));
+    PROPERTIES.setProperty('nextMainFolderIndex', '0');
+    
+    mainFolderId = mainFolderIds[0];
+  } else {
+    console.log("Reanudando inventario.");
   }
+  
+  const allMainFolderIds = JSON.parse(PROPERTIES.getProperty('mainFolderIds'));
+  
+  for (let i = nextMainFolderIndex; i < allMainFolderIds.length; i++) {
+    const folderId = allMainFolderIds[i];
+    const folder = DriveApp.getFolderById(folderId);
+    const sheetName = folder.getName().replace(/[/\\?*\[\]:]/g, '_').substring(0, 50);
+
+    // Reinicia la hoja si no está en la reanudación de una hoja existente
+    const lastProcessedSheet = PROPERTIES.getProperty('lastProcessedSheet');
+    if (lastProcessedSheet !== sheetName) {
+      initializeSheet(sheetName);
+    }
+
+    try {
+      console.log(`Procesando carpeta '${sheetName}'...`);
+      startTime = new Date();
+      processFolderAndFiles(folder, sheetName, 0, "");
+      writeDataToSheet(sheetName); // Escribir datos restantes
+      
+      const sheet = getSheetByName(sheetName);
+      sheet.autoResizeColumns(1, 8);
+      if (sheet.getLastRow() > 1) {
+        sheet.getRange(1, 1, sheet.getLastRow(), 8).createFilter();
+      }
+      sheet.setFrozenRows(1);
+      
+      // Actualiza el índice de la siguiente carpeta principal a procesar
+      PROPERTIES.setProperty('nextMainFolderIndex', (i + 1).toString());
+
+    } catch (e) {
+      console.error(`Error procesando '${sheetName}': ${e.message}`);
+      return { status: "PARTIAL", message: e.message };
+    }
+  }
+
+  // Limpiar propiedades al finalizar
+  PROPERTIES.deleteProperty('mainFolderIds');
+  PROPERTIES.deleteProperty('nextMainFolderIndex');
+  PROPERTIES.deleteProperty('lastProcessedSheet');
+  PROPERTIES.deleteProperty('lastProcessedFolder');
+
+  return { status: "COMPLETE", message: "Inventario de todas las carpetas completado." };
 }
 
-// REPORTING ======================================================
-function sendInventoryReport(results) {
-  const subject = `BEST Lyon Inventory ${results.status}`;
-  let body = `Inventory of your Drive folder is ${results.status.toLowerCase()}.\n\n`;
-  body += `Folders processed: ${results.folders}\n`;
-  body += `Files processed: ${results.files}\n`;
-  body += `Duration: ${Math.round(results.duration/60)} minutes\n`;
-
-  if (results.error) {
-    body += `\nError: ${results.error}\n`;
-  }
-
-  body += `\nView results: ${GOOGLE_SHEET_URL}`;
-
-  MailApp.sendEmail(EMAIL_RECIPIENT_ADDRESS, subject, body);
-}
-
-// ENTRY POINT ====================================================
+// PUNTO DE ENTRADA ==================================================
 function runDriveInventory() {
-  console.log("Starting BEST Lyon inventory...");
   const results = generateDriveTree();
-
-  sendInventoryReport(results);
-
-  console.log(`
-    Inventory ${results.status}
-    Folders: ${results.folders}
-    Files: ${results.files}
-    ${results.error ? 'Error: ' + results.error : ''}
-  `);
-
-  return results;
+  console.log(results.message);
+  MailApp.sendEmail(EMAIL_RECIPIENT_ADDRESS, `Inventario de Drive - ${results.status}`, results.message + `\n\nVer resultados: ${GOOGLE_SHEET_URL}`);
 }
-
-
- 
